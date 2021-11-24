@@ -1,0 +1,514 @@
+---
+title: "iASPP KO in Mouse Keratinocytes: ChIP-seq and RNA-seq Analyses"
+author: "Thomas M. Carroll"
+date: "3 November 2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Initial preparation
+#### Load libraries and set seed
+```{r, warning=FALSE, message=FALSE}
+library(readr)
+library(DESeq2)
+library(AnnotationDbi)
+library(rtracklayer)
+library(org.Mm.eg.db)
+library(plyr)
+library(tidyverse)
+library(reshape2)
+library(ChIPpeakAnno)
+library(TxDb.Mmusculus.UCSC.mm10.ensGene)
+library(fgsea)
+library(cowplot)
+library(EnhancedVolcano)
+library(mygene)
+library(limma)
+library(pheatmap)
+library(purrr)
+library(kableExtra)
+set.seed(031121)
+```
+
+#### Set working directory
+If running locally, please modify the working directory to the location of this folder on your machine.  
+
+```{r}
+setwd("/mnt/lustre/archive/tcarroll/iaspp_rnaseq_mouse_keratinocytes/git_repo")
+```
+
+### RNA-seq analysis
+#### Set-up
+Load counts document and set up metadata table.  
+I remove very lowly expressed genes (keep genes with 3 or more counts in half the samples).
+```{r}
+mk_count = read.delim("files/MKC_iASPP_rawCounts.txt", comment.char = "#", stringsAsFactors = FALSE)
+rownames(mk_count) = mk_count$Geneid
+mk_count = as.data.frame(mk_count[,7:12])
+mk_count = mk_count[rowSums(mk_count>3)>2,]
+coldata = data.frame(sample = colnames(mk_count), condition = factor(c("KO", "KO", "KO", "WT", "WT", "WT")), row.names = colnames(mk_count))
+coldata$batch = factor(c("B1", "B2", "B3", "B1", "B2", "B3"))
+```
+
+Create DESeq2 object and confirm iASPP (*Ppp1r13l*) depletion.  
+Samples come in 3 paired batches (B1-B3). For each batch, half of the pool was taken for further culture with tamoxifen treatment (KO), and half for culture without tamoxifen (WT).  
+Note some variation in iASPP expression across batches.
+```{r}
+mk = DESeqDataSetFromMatrix(as.matrix(mk_count), coldata, design = ~batch+condition)
+mk$condition = relevel(mk$condition, ref = "WT")
+plotCounts(mk, "Ppp1r13l", transform = F,normalized = T)
+plotCounts(mk, "Ppp1r13l", intgroup = c("batch", "condition"), transform = F, normalized = T)
+```
+
+#### Batch effect exploration and correction
+Without batch effect removal, batch signal dominates PC1, iASPP genotype PC2.  
+(VST columns are reordered here with WT first for later heatmap plotting).
+```{r}
+vst_mk = varianceStabilizingTransformation(mk)
+colnames(vst_mk) = c("KO_1", "KO_2", "KO_3", "WT_1", "WT_2", "WT_3")
+vst_mk = vst_mk[,c(4:6,1:3)]
+plotPCA(vst_mk, intgroup = c("condition"))
+plotPCA(vst_mk, intgroup = c("batch"))
+```
+
+Regressing out batch effect improves iASPP genotype separation in PCA.  
+I therefore use batch corrected VST counts for plots, and control for batch in later DESeq2 design formula.
+```{r}
+vst_mk_batch = vst_mk
+assay(vst_mk_batch) = removeBatchEffect(assay(vst_mk_batch), batch = vst_mk_batch$batch)
+plotPCA(vst_mk_batch, intgroup = "condition")
+plotPCA(vst_mk_batch, intgroup = "batch")
+```
+
+#### Differential expression workflow
+Now, we get DESeq2 results for iASPP KO v WT, while regressing out batch effect.  This uses the ~batch+condition formula set earlier.  
+res_mk_final contains results following LFCShrink ('ashr' method) to generate moderated fold-change estimates. These moderated fold changes are used as the input statistic for GSEA.  
+Genes with NA p.adj (incl. lowly expressed genes not passing expression filter) are removed.  
+An FDR of 0.05 is used as the threshold to determine differential expression.
+```{r message=FALSE}
+mk = DESeq(mk, fitType = "local")
+res_mk = results(mk, contrast = c("condition", "KO", "WT"))
+summary(res_mk, alpha = 0.05)
+res_mk_final = as.data.frame(lfcShrink(dds = mk, res = res_mk, type = "ashr",
+                                       coef = which(resultsNames(mk)=="condition_KO_vs_WT")))
+res_mk_final = res_mk_final[!is.na(res_mk_final$padj),]
+res_mk_final$symbol = rownames(res_mk_final)
+```
+Adding in ensembl IDs and location info from GTF file used for feature counting.  
+Adding in Entrez IDs using AnnotationDbi::mapID function.
+```{r message=FALSE}
+gtf = import("files/gencode.vM25.primary_assembly.annotation.gtf")
+gtf = as.data.frame(gtf)
+gtf = gtf[gtf$type=="gene",c("gene_id","gene_name","seqnames","start","end")]
+gtf$gene_id = unlist(lapply(strsplit(gtf$gene_id,"[.]"),"[[",1))
+gtf = gtf[!duplicated(gtf$gene_name),]
+colnames(gtf) = c("ensembl","symbol","gene_seqnames","gene_start","gene_end")
+res_mk_final = merge(res_mk_final, gtf, by = "symbol", all.x = T)
+rownames(res_mk_final) = res_mk_final$symbol
+res_mk_final$entrez = mapIds(org.Mm.eg.db, keys = rownames(res_mk_final), column = "ENTREZID",keytype = "SYMBOL")
+res_mk_final = res_mk_final[order(res_mk_final$padj),]
+```
+
+#### Overview of differential expression results
+Let's make our broad RNA-seq summary figures (**Figure 2B**). First, volcano plot:  
+*To label top 50 up and down DEGs, switch selectLab = "" to selectLab = DE100 in EnhancedVolcano call.*
+```{r}
+up50 = head(res_mk_final$symbol[res_mk_final$log2FoldChange>0], 50)
+down50 = head(res_mk_final$symbol[res_mk_final$log2FoldChange<0], 50)
+DE100 = c(up50, down50)
+keyvals = ifelse(res_mk_final$padj>=0.05,"grey50", ifelse(res_mk_final$log2FoldChange>0, "orange", "royalblue1"))
+names(keyvals)[keyvals=="grey50"] = "not enriched"
+names(keyvals)[keyvals=="orange"] = "enriched in KO"
+names(keyvals)[keyvals=="royalblue1"] = "enriched in WT"
+table(names(keyvals))
+EnhancedVolcano(res_mk_final, lab = res_mk_final$symbol,
+                x = "log2FoldChange", y = "padj",FCcutoff = 0, pCutoff = 0.05, pLabellingCutoff = 1e-8,
+                title = NULL, subtitle = NULL, caption = NULL, colCustom = keyvals, legendLabSize = 12,
+                axisLabSize = 12, labSize = 3, cutoffLineType = "blank", ylim = c(0,56.5),
+                legendPosition = "right", selectLab = "", drawConnectors = T, widthConnectors = 0.2,
+                lengthConnectors = unit(0,"npc"),xlim = c(-2.05,2.05))
+```
+<br>
+Next, a summary heatmap of top 50 upregulated DEGs (used both in **Figure 2B** and **Figure S4A**):
+```{r fig.width=3.5,fig.height=8}
+pheatmap(assay(vst_mk_batch[up50,]), scale = "row", fontsize_row = 9, cluster_cols = F, cluster_rows=F)
+```
+
+
+To view the top 10 DEGs:
+```{r results="asis"}
+kbl(res_mk_final[1:10,], caption = "Top 10 DEGs (iASPP KO vs. WT)")%>%kable_styling()
+```
+The following command recreates DE summary table "MKC_iASPP_DE_output.txt" (change to eval=TRUE to run, modify name to avoid overwriting):
+```{r eval=FALSE}
+write.table(res_mk_final[,1:7], "output/MKC_iASPP_DE_output.txt",
+            sep = "\t", quote = F, col.names = T, row.names = F)
+```
+
+
+#### Gene set enrichment analyses and visualization
+First, load our gene set files. I use C3 TFT Legacy, Hallmark, and C5/GO-BP from MSigDB.  
+I use the provided chip to convert gene sets between human and mouse orthologs.
+
+```{r}
+tfts = gmtPathways("files/c3.tft.tft_legacy.v7.1.symbols.gmt")
+hallmark = gmtPathways("files/h.all.v7.1.symbols.gmt")
+bp = gmtPathways("files/c5.bp.v7.1.symbols.gmt")
+mouse_hum = read.delim("files/Mouse_Gene_Symbol_Remapping_to_Human_Orthologs_MSigDB.v7.1.chip", stringsAsFactors=FALSE)
+mouse_hum = mouse_hum[,1:2]
+bp_mouse = list()
+for(i in 1:length(bp)){
+  bp_mouse[[i]] = mouse_hum[mouse_hum$Gene.Symbol%in%bp[[i]],1]
+  bp_mouse[[i]] = bp_mouse[[i]][bp_mouse[[i]]%in%gtf$symbol]
+  names(bp_mouse)[i] = names(bp)[i]
+}
+hallmark_mouse = list()
+for(i in 1:length(hallmark)){
+  hallmark_mouse[[i]] = mouse_hum[mouse_hum$Gene.Symbol%in%hallmark[[i]],1]
+  hallmark_mouse[[i]] = hallmark_mouse[[i]][hallmark_mouse[[i]]%in%gtf$symbol]
+  names(hallmark_mouse)[i] = names(hallmark)[i]
+}
+tfts_mouse = list()
+for(i in 1:length(tfts)){
+  tfts_mouse[[i]] = mouse_hum[mouse_hum$Gene.Symbol%in%tfts[[i]],1]
+  tfts_mouse[[i]] = tfts_mouse[[i]][tfts_mouse[[i]]%in%gtf$symbol]
+  names(tfts_mouse)[i] = names(tfts)[i]
+}
+```
+
+
+Create our score vector for GSEA based on the DESeq2-calculated moderated fold change:
+```{r}
+stats = res_mk_final$log2FoldChange
+names(stats) = res_mk_final$symbol
+stats = stats[!is.na(names(stats))]
+stats = stats[!duplicated(names(stats))]
+```
+
+Now, we run GSEA. First for GO-BP and Hallmark pathways (**Figure S2A**):
+```{r message=FALSE, warning=FALSE}
+total = c(hallmark_mouse, bp_mouse)
+set.seed(031121)
+res_total = fgseaMultilevel(pathways = total, stats = stats, minSize = 10, maxSize = 1000, nproc = 1)
+res_total = res_total[order(res_total$pval,-abs(res_total$NES)),]
+res_total_sub = rbind(head(res_total[res_total$NES<0,],10), head(res_total[res_total$NES>0,],10))
+res_total_sub%>%mutate(ordering = -log10(pval)*sign(NES), pos = NES/2, padj = formatC(padj, 2, format = "e"))%>%
+  arrange(NES)%>%
+  mutate(pathway = factor(pathway, levels = pathway))%>%
+  ggplot(aes(y = NES, x = pathway, label = padj))+
+  geom_col(fill = ifelse(res_total_sub$NES>0, "orange", "royalblue1"))+
+  coord_flip()+theme_cowplot()+
+  theme(axis.text.y = element_text(size = 8))+labs(x = "Pathway",y = "Normalized Enrichment Score")+
+  geom_hline(yintercept = 0,lty = 2)+
+  geom_text(aes(y = pos),color = "white")
+```
+
+Then for the C3 TFT (legacy) database (**Figure S2B**):
+```{r message=FALSE, warning=FALSE}
+set.seed(031121)
+res = fgseaMultilevel(pathways = tfts_mouse, stats = stats,
+            minSize = 10, maxSize = 1000)
+res = res[order(res$pval,-abs(res$NES)),]
+res$leadingEdge = as.character(res$leadingEdge)
+res_sub = rbind(head(res[res$NES<0,],10), head(res[res$NES>0,],10))
+res_sub%>%mutate(ordering = -log10(pval)*sign(NES), pos = NES/2, padj = formatC(padj, 2, format = "e"))%>%
+  arrange(NES)%>%
+  mutate(pathway = factor(pathway, levels = pathway))%>%
+  ggplot(aes(y = NES, x = pathway, label = padj))+
+  geom_col(fill = ifelse(res_sub$NES>0, "orange", "royalblue1"))+
+  coord_flip()+theme_cowplot()+
+  theme(axis.text.y = element_text(size = 8))+labs(x = "Pathway",y = "Normalized Enrichment Score")+
+  geom_hline(yintercept = 0, lty = 2)+
+  geom_text(aes(y = pos), color = "white")
+```
+   
+To explore Keratinization pathway further, we show GSEA enrichment plot and volcano plot from above with keratinization genes highlighted (**Figure S2C and Figure S2D**):
+```{r}
+plotEnrichment(total$GO_KERATINIZATION, stats, ticksSize = 0.2)+
+  theme_classic(base_size = 14)+labs(title = "GO_KERATINIZATION")+
+  geom_text(aes(x = 12500, y = 0.5,
+                label = paste0("FDR = ",formatC(res_total$padj[res_total$pathway=="GO_KERATINIZATION"], digits = 3))))
+EnhancedVolcano(res_mk_final,lab = res_mk_final$symbol,
+                x = "log2FoldChange", y = "padj", FCcutoff = 0, pCutoff = 0.05,
+                title = NULL, subtitle = NULL, caption = NULL, colCustom = keyvals,
+                axisLabSize = 12, cutoffLineType = "blank", ylim = c(0,15.5), labSize = 3.5, legendLabSize = 12,
+                legendPosition = "right", xlim = c(-1.9,1.9),
+                selectLab = res_mk_final$symbol[(res_mk_final$symbol)%in%bp_mouse$GO_KERATINIZATION&res_mk_final$padj<0.05],
+                pointSize = ifelse((res_mk_final$symbol)%in%bp_mouse$GO_KERATINIZATION&res_mk_final$padj<0.05, 2, 1),
+                colAlpha = ifelse((res_mk_final$symbol)%in%bp_mouse$GO_KERATINIZATION&res_mk_final$padj<0.05, 1, 0.1),
+                drawConnectors = T,widthConnectors = 0.35,lengthConnectors = unit(0, "npc"))
+```
+
+We also examine where DEGs from the Epidermal Differentiation Complex (EDC) on mouse chromosome 3 fall on our volcano plot (**Figure 3B**):
+```{r}
+vec = res_mk_final$gene_seqnames=="chr3"&res_mk_final$gene_start>=90314169&res_mk_final$gene_end<=93394831&res_mk_final$padj<0.05
+EnhancedVolcano(res_mk_final, lab = res_mk_final$symbol,
+                x = "log2FoldChange", y = "padj", FCcutoff = 0, pCutoff = 0.05,
+                title = NULL, subtitle = NULL, caption = NULL, colCustom = keyvals,
+                axisLabSize = 12, labSize = 3.5, cutoffLineType = "blank", ylim = c(0,31.5), legendLabSize = 12,
+                legendPosition = "right", xlim = c(-2,2),
+                selectLab = res_mk_final$symbol[vec],
+                pointSize = ifelse(vec,2,1), colAlpha = ifelse(vec, 1, 0.1),
+                drawConnectors = T, widthConnectors = 0.35, lengthConnectors = unit(0, "npc"))
+```
+
+Get VST values for individual genes assessed in **Figure 3C**:
+```{r}
+subgenes = as.data.frame(t(assay(vst_mk_batch[c("Ivl","S100a7a","S100a8","S100a9","Mdm2"),])))
+subgenes$condition = vst_mk_batch$condition
+subgenes$replicate = rownames(subgenes)
+
+subgenes2 = melt(subgenes,id.vars = c("condition","replicate"),variable.name = "Gene")
+subgenes2%>%ggplot(aes(x = condition, y = value, label = replicate))+geom_jitter(width = 0)+
+  facet_wrap(~Gene, scales = "free")+theme_cowplot()+labs(y = "VST Normalized Expression", x = NULL)+
+  geom_text_repel(nudge_x = 0.25)
+```
+
+Write the output table for **Figure 3C** (change to eval=TRUE to run, modify name to avoid overwriting):
+```{r, eval=FALSE}
+write.table(subgenes,"output/3C_key_gene_expr.txt", sep = "\t", col.names = T, row.names = F, quote = F)
+```
+
+Volcano plot with genes in top inflammatory pathways from GSEA analysis (Hallmark TNFa/NFkB Signaling and GO Response to Bacterium) labelled (**Figure S4A**):
+```{r}
+EnhancedVolcano(res_mk_final, lab = res_mk_final$symbol,
+                x = "log2FoldChange", y = "padj", FCcutoff = 0, pCutoff = 0.05,
+                title = NULL, subtitle = NULL, caption = NULL, colCustom = keyvals,
+                axisLabSize = 12, cutoffLineType = "blank", ylim = c(0,32), labSize = 3.25, legendLabSize = 12,
+                legendPosition = "right", xlim = c(-1.9,1.9),
+                selectLab = res_mk_final$symbol[res_mk_final$symbol%in%c(total$HALLMARK_TNFA_SIGNALING_VIA_NFKB,total$GO_RESPONSE_TO_BACTERIUM)&res_mk_final$padj<5e-5],
+                pointSize = ifelse(res_mk_final$symbol%in%c(total$HALLMARK_TNFA_SIGNALING_VIA_NFKB,total$GO_RESPONSE_TO_BACTERIUM)&res_mk_final$padj<0.05, 2, 1),
+                colAlpha = ifelse(res_mk_final$symbol%in%c(total$HALLMARK_TNFA_SIGNALING_VIA_NFKB,total$GO_RESPONSE_TO_BACTERIUM)&res_mk_final$padj<0.05, 1, 0.1),
+                drawConnectors = T,widthConnectors = 0.5,lengthConnectors = unit(0, "npc"))
+```
+
+### ChIP-seq analysis and RNA-seq integration
+#### MAnorm summary
+In this section I quantify how p63 ChIP-seq signal changes across the genome following iASPP KO, and integrate with RNA-seq data.  
+First, load MAnorm results for all peaks. For each peak region, M is normalized log2 fold change (differential binding) across samples, A is average amplitude, p is the significance score for differential binding. See https://manorm.readthedocs.io/en/latest/usage.html#output-files for more info.   
+Deduplicating 22 fringe cases where header is duplicated (due to subpeaks from macs call).  
+In this code, alpha sets the p-value threshold to determine differentially bound peaks (here, I use 5e-3)
+```{r}
+set.seed(031121)
+manorm = read.delim("files/iASPP_KO_vs_iASPP_WT_all_MAvalues.xls", stringsAsFactors = FALSE)
+manorm$header = paste0(manorm$chr, ":", manorm$start, "-", manorm$end)
+manorm = manorm[!duplicated(manorm$header),]
+alpha = 5e-3
+manorm = manorm%>%mutate(sig = ifelse(P_value<alpha&M_value>0, "Enriched in iASPP KO",
+                                      ifelse(P_value<alpha&M_value<0, "Enriched in iASPP WT", "Not Enriched")))
+manorm$sig = factor(manorm$sig, levels = c("Enriched in iASPP KO", "Not Enriched", "Enriched in iASPP WT"))
+table(manorm$sig)
+```
+
+Write BED files for manorm output subsets. These will be used to extract fasta sequences from our ChIP-seq reference using bedtools getfasta. These fastas are used for input to STREME (https://meme-suite.org/meme/tools/streme), which generate the average p63 motifs reported in **Figure S2E**. Fasta files and STREME outputs are found in output/. Change to eval=TRUE to re-export, and modify file name to avoid overwriting.
+```{r eval=TRUE}
+write.table(manorm[manorm$sig=="Enriched in iASPP KO",c("chr", "start", "end")], "output/p63_peaks_enriched_iASPP_KO.bed", sep = "\t", quote = F, col.names = F, row.names = F)
+write.table(manorm[manorm$sig=="Not Enriched",c("chr", "start", "end")], "output/p63_peaks_not_enriched.bed", sep = "\t", quote = F, col.names = F, row.names = F)
+write.table(manorm[manorm$sig=="Enriched in iASPP WT",c("chr", "start", "end")], "output/p63_peaks_enriched_iASPP_WT.bed", sep = "\t", quote = F, col.names = F, row.names = F)
+```
+
+
+Summary plot of MAnorm results (**Figure 2C**):
+```{r}
+manorm%>%drop_na(sig)%>%ggplot(aes(x = A_value, y = M_value, color = sig))+
+  geom_point(alpha = 0.7)+theme_cowplot(font_size = 14)+
+  labs(color = "Peak Class", x = "Average Signal (A)", y = "Log2 Fold Change (M)")
+manorm$sig = NULL
+```
+#### Correlation of M value with transcription factor motif scores
+Read in the motif results from FIMO for all motifs in JASPAR database for each peak.  
+Adjust the FIMO p-values, and merge in with MAnorm output by scores (out, for continuous work/correlation) and by motif qvals (out2, for binary presence/absence calls).
+```{r message=FALSE}
+motif = read_delim("files/fimo_out.txt", 
+                    "\t", escape_double = FALSE, col_names = FALSE, 
+                    trim_ws = TRUE, progress = F)
+motif = motif[,1:8]
+colnames(motif) = c("Motif_ID", "Motif_Name", "header", "start", "end", "strand", "score", "p.val")
+motif = motif %>% dplyr::group_by(Motif_ID)%>%mutate(q.val = p.adjust(p.val, method = "BH"))
+
+scores = dcast(motif, header~Motif_Name, value.var = "score")
+qvals  = dcast(motif, header~Motif_Name, value.var = "q.val")
+pvals  = dcast(motif, header~Motif_Name, value.var = "p.val")
+
+out = merge(manorm, scores, by = "header")
+out2 = merge(manorm, qvals, by = "header")
+```
+
+Now, checking correlation of FIMO score at each peak region with log2 fold change (differential binding after iASPP KO) from MAnorm. I show this for both normalized (M_value) and unnormalized (raw_M_value) log2 fold change stats; these give similar results, but the default normalized M value is used in the paper.  
+I then print the top 10 positive correlations to examine, which are all AP-1 members.
+```{r}
+cor_score = vector("numeric", length = 579)
+for(i in 1:length(cor_score)){
+  cor_score[i] = cor(out$M_value,out[,colnames(out)[i+17]], method = "spearman")
+}
+names(cor_score) = colnames(out)[18:596]
+
+cor_score_raw = vector("numeric", length = 579)
+for(i in 1:length(cor_score_raw)){
+  cor_score_raw[i] = cor(out$raw_M_value, out[,colnames(out)[i+17]], method = "spearman")
+}
+names(cor_score_raw) = colnames(out)[18:596]
+cors = data.frame(M_value = cor_score, raw_M_value = cor_score_raw)
+ap1 = c(grep("Jun", rownames(cors), ignore.case = T, value = T),
+            grep("Fos", rownames(cors), ignore.case = T, value = T),
+            grep("Jdp", rownames(cors), ignore.case = T,value = T))
+p53 = grep("TP.3", rownames(cors), ignore.case = T, value = T)
+nfkb = c(grep("NFKB", rownames(cors), ignore.case = T, value = T),
+         grep("^REL", rownames(cors), ignore.case = T, value = T))
+e2f = grep("E2F", rownames(cors), ignore.case = T, value = T)
+cors = cors[order(cors$M_value),]
+cors%>%arrange(-M_value)%>%dplyr::slice(1:10)%>%kbl(caption = "Top 10 motifs correlated with enriched p63 binding after iASPP KO")%>%kable_styling()
+```
+**Figure 2D** plots the distribution of correlation coefficients for all TF motifs, showing how AP-1 members stand out from other TFs in terms of the strength of this correlation. Dashed line at zero represents the location if there were no correlation between differential binding and TF motif score.  
+This suggests p63 shifts towards sites with AP-1 motifs following iASPP KO.  
+Other gene families of interest (p53, E2F linked with transcriptionally downregulated genes, other iASPP binding family NFkB) are not strongly associated with this signal.
+```{r, fig.width=10,fig.height=8}
+plot(cors$M_value, col = ifelse(rownames(cors)%in%e2f, "orange",
+                              ifelse(rownames(cors)%in%ap1, "blue1",
+                                     ifelse(rownames(cors)%in%p53, "green",
+                                            ifelse(rownames(cors)%in%nfkb, "violetred", rgb(0,0,0,0.1))))),
+     pch = 16, ylab = "Spearman Correlation Coefficient",
+     main = "Correlation between Motif Score and p63 Binding Enrichment after iASPP KO")
+abline(h = 0, lty = 2)
+legend(legend = c("AP-1 Family","E2F Family","NF-kB Family","p53 Family"),
+       pch = 16, col = c("red", "orange", "blue", "green"), "topleft", cex = 1.2)
+```
+
+#### Investigation of AP-1 correlation with varying p63 motif strength
+The above result suggested AP-1 can increase p63 binding at certain sites, which can be interfered with by iASPP.  
+Cooperative genome binding between p63 and cofactors (e.g. AP-1) is likely more important at sites with weak p63 motifs, which may not be easily bound by p63 alone. Therefore, impact of iASPP KO on p63-AP1 interactions may be most visible at these weak p63 sites.  
+To test this, we identified the peaks with top 20% (strongest) and bottom 20% (weakest) p63 motifs, based on FIMO p-values. We then look for the rate of AP-1 motif detection (using JUNB as exemplar, with FIMO FDR<1e-3 to determine motif presence) in our MAnorm peak classes following iASPP KO, but separating results by whether the underlying p63 motif is weak or strong.  
+The resulting plot (**Figure S2F**) shows that p63 binding is enriched at AP-1 motif sites following iASPP KO across p63 motif classes, but that this enrichment is clearest in peaks with weaker p63 motifs.
+```{r message=FALSE, fig.height=5, fig.width=8.5}
+out2 = out2[order(out2$TP63, decreasing=F),]
+out2$TP63_quintile = NA
+out2$TP63_quintile[1:4184] = "Top Quintile TP63 Motif Strength (n=4184)"
+out2$TP63_quintile[16739:20922] = "Bottom Quintile TP63 Motif Strength (n=4184)"
+##Figure S2F
+out2%>%mutate(sig = factor(ifelse(P_value<alpha&M_value>0, "Enriched in iASPP KO",
+                                  ifelse(P_value<alpha&M_value<0, "Enriched in iASPP WT","Not Enriched")),
+                           levels = c("Enriched in iASPP KO", "Not Enriched", "Enriched in iASPP WT")))%>%
+  group_by(sig, TP63_quintile)%>%drop_na(sig, TP63_quintile)%>%summarize(JUNB = mean(JUNB<1e-3))%>%
+  ggplot(aes(x = sig, y = JUNB))+geom_bar(stat = "identity")+theme_cowplot(font_size = 12)+
+  facet_wrap(~TP63_quintile)+labs(y = "Percentage of Peaks with JUNB Motif Hits", x = "Peak Class")+
+  theme(axis.text.x.bottom = element_text(size=10))
+out2$TP63_quintile = NULL
+```
+
+
+#### Integration with RNA-seq
+Now, we annotate peaks to the nearest gene, and use this to combine with earlier differential expression analysis.  
+I use the mm10 ensGene TxDb for this, which is a bit more curated (39k genes) than making a custom TxDb from the raw GTF (55k genes).  
+Both options give similar results (and highly similar outputs for sig.test() calls below).  
+These annotatePeakInBatch options assign each peak to the nearest TSS in ensGene TxDb.
+```{r}
+annoData = toGRanges(TxDb.Mmusculus.UCSC.mm10.ensGene, feature = "gene")
+
+out2_anno = makeGRangesFromDataFrame(out2, ignore.strand = T)
+names(out2_anno) = out2$header
+anno = annotatePeakInBatch(out2_anno, AnnotationData = annoData, featureType = "TSS", select = "first")
+anno = as.data.frame(anno)
+```
+
+Now I do some categorization of peaks into classes (not needed for sig.test() calls below, but helps for manual exploration).  
+For this work, peaks within 2kb of TSS (up or downstream) are considered in promoter region.  
+Those outside of +/-2kb but within +/-20kb of TSS are considered in enhancer region.  
+```{r}
+anno$insideFeature = factor(anno$insideFeature,
+                            levels = c("overlapStart", "upstream", "includeFeature", "inside", "overlapEnd", "downstream"))
+rownames(anno) = NULL
+table(anno$insideFeature)
+anno$featureType = NA
+anno$featureType[anno$insideFeature%in%c("upstream", "downstream")] = "Near Intergenic"
+anno$featureType[abs(anno$distancetoFeature)<=2000] = "Promoter"
+anno$featureType[anno$distancetoFeature>= -20000&anno$distancetoFeature<= -2000] = "Upstream Enhancer"
+anno$featureType[anno$distancetoFeature<= 20000&anno$distancetoFeature>= 2000] = "Downstream Enhancer"
+anno$featureType[anno$distancetoFeature> 20000&anno$insideFeature%in%c("inside", "overlapEnd")] = "Other Intragenic"
+anno$featureType[anno$featureType%in%c("Near Intergenic")&abs(anno$distancetoFeature)>75000] = "Far Intergenic"
+anno$featureType = factor(anno$featureType,
+                          levels = c("Upstream Enhancer", "Promoter", "Downstream Enhancer",
+                                   "Other Intragenic", "Near Intergenic", "Far Intergenic"))
+```
+
+Now we integrate peak-wise MAnorm results with RNA-seq differential expression output (res_mk_final), and with binary TF motif calls for those peaks (out2_logic, using FIMO FDR cutoff of 1e-3 for presence). This results in a final integrated dataframe (final) which is useful for manual exploration. Genes with *NA* in MAnorm/FIMO fields have no annotated peaks.  
+Note- this merge removes all peaks that are not annotated to expressed genes in res_mk_final.
+This code also defines some classes of entries to assist manual exploration (whether gene is DE in RNA-seq, whether peak is differentially bound peak in ChIP-seq, and whether gene is in EDC).
+```{r}
+int = merge(res_mk_final, anno, by.x = "ensembl", by.y = "feature", all.x = T)
+out2_logic = out2
+out2_logic[,18:596] = out2_logic[,18:596]<1e-3
+
+final = merge(int, out2_logic[,c(1,6,7,10,18:596)], by.x = "peak", by.y = "header", all.x = T)
+final = final[order(final$padj),]
+final$DE_class = "NS"
+final$DE_class[final$log2FoldChange>0&final$padj<0.05] = "upreg"
+final$DE_class[final$log2FoldChange<0&final$padj<0.05] = "downreg"
+
+final$EDC = F
+final$EDC = final$gene_seqnames=="chr3"&final$gene_start>=90314169&final$gene_end<=93394831
+final$EDC[final$EDC==F] = "Other Locations"
+final$EDC[final$EDC==T] = "Epidermal Differentiation Complex"
+
+final = final%>%mutate(peak_class = ifelse(P_value<alpha&M_value>0, "Enriched in iASPP KO",
+                                           ifelse(P_value<alpha&M_value<0, "Enriched in iASPP WT", "Not Enriched")))
+final$peak_class = factor(final$peak_class, levels=c("Enriched in iASPP KO", "Not Enriched", "Enriched in iASPP WT"))
+```
+
+To check the distribution of p63 binding sites across expressed genes (**Figure 3A**):
+```{r}
+final$featureType2 = recode(final$featureType,`Upstream Enhancer`="Enhancer",`Downstream Enhancer`="Enhancer",
+                           `Other Intragenic`="Other",`Near Intergenic`="Other",`Far Intergenic`="Other")
+pie1(table(final$featureType2))
+```
+
+#### Testing the impact of ChIP-seq findings on odds of RNA-seq upregulation
+To complete the integration, we test whether certain findings at a ChIP-seq peak affect the odds of differential expression at the gene to which that peak is annotated (**Figure S3**). To do this, a custom function involving prop.test() is employed, which tests for significant differences in the frequency of upregulated expression for a certain class of genes against the reference set of all expressed genes (res_mk_final).  
+Here, we also use JUNB as the exemplar for AP-1. Substitution of other highly correlated AP-1 motifs shows very similar results.
+```{r warning=FALSE}
+sig.test = function(input, title = NULL){
+  z = input
+  z = z[!duplicated(z$symbol),]
+  upreg = prop.test(x = c(sum(z$DE_class=="upreg"),
+                          nrow(res_mk_final[res_mk_final$padj<0.05&res_mk_final$log2FoldChange>0,])),
+                    n = c(nrow(z), nrow(res_mk_final)))
+  if(!is.null(title)){
+    cat("\n","\t",title,"\n")
+  }
+  cat("\n","Proportion of differentially expressed genes in test set")
+  print(table(z$DE_class)/sum(table(z$DE_class)))
+  cat("\n", "prop.test() for upregulation:", "\n")
+  print(paste0("OR = ", round(upreg$estimate[1]/upreg$estimate[2],2), "; p = ", format(upreg$p.value,digits = 3)))
+  cat("\n")
+}
+
+sig.test(final, title = "Reference Set (all expressed genes)")
+sig.test(final[!is.na(final$TP63),], title = "Any p63 peak")
+sig.test(final[final$peak_class=="Enriched in iASPP KO"&!is.na(final$TP63),],
+         title = "p63 peak significantly enriched in iASPP KO")
+sig.test(final[final$peak_class=="Not Enriched"&!is.na(final$TP63),],
+         title = "p63 peak which is not significantly changed following iASPP KO")
+sig.test(final[final$peak_class=="Enriched in iASPP WT"&!is.na(final$TP63),],
+         title = "p63 peak significantly enriched in iASPP WT")
+
+sig.test(final[!is.na(final$TP63)&final$JUNB&abs(final$distancetoFeature)<20000,],
+         title="p63 peak within 20kb of TSS that contains an AP-1 motif (FDR < 1e-3)")
+
+sig.test(final[!is.na(final$TP63)&final$JUNB&abs(final$distancetoFeature)<20000&final$TP63,],
+         title = "p63 peak with AP-1 motif and p63 motif (FDR < 1e-3) within 20kb of TSS")
+sig.test(final[!is.na(final$TP63)&final$JUNB&abs(final$distancetoFeature)<20000&!final$TP63,],
+         title = "p63 peak with AP-1 motif without detected p63 motif (FDR < 1e-3) within 20kb of TSS")
+
+sig.test(final[final$EDC=="Epidermal Differentiation Complex",],title = "Epidermal Differentiation Complex")
+sig.test(final[final$EDC=="Epidermal Differentiation Complex"&!is.na(final$TP63)&abs(final$distancetoFeature)<20000,],
+         title = "Epidermal Differentiation Complex, p63 peak within 20kb of TSS")
+```
+
+
+### Session info
+```{r}
+sessionInfo()
+```
+
