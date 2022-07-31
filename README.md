@@ -1,4 +1,4 @@
-﻿# Recreating iASPP KO paper analysis 
+﻿# Recreating analyses for JNK-iASPP-AP1 axis paper (Al Moussawi *et al*., 2022)
 ## Recreate files needed for downstream analysis
 First, download (untrimmed) RNA-seq and ChIP-seq fastq files from GEO repositories into your analysis directory, BASE_DIR:
 
@@ -105,3 +105,7 @@ Then can run STREME (v5.4.1) at the web server (https://meme-suite.org/meme/tool
 
 ## Citation
 If using the data or analyses from this repository or the underlying publication in your work, please make sure to cite the following publication:
+"Mutant Ras and inflammation-driven skin tumorigenesis is suppressed via a JNK-iASPP-AP1 axis". Al Moussawi *et al*. *Cell Reports*, 2022. 
+
+## Need help?
+Ping me a message @t-carroll, or raise an issue on the tab above!
