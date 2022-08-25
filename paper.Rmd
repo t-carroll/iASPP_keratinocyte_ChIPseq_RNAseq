@@ -367,14 +367,14 @@ This suggests p63 shifts towards sites with AP-1 motifs following iASPP KO.
 Other gene families of interest (p53, E2F linked with transcriptionally downregulated genes, other iASPP binding family NFkB) are not strongly associated with this signal.
 ```{r, fig.width=10,fig.height=8}
 plot(cors$M_value, col = ifelse(rownames(cors)%in%e2f, "orange",
-                              ifelse(rownames(cors)%in%ap1, "blue1",
+                              ifelse(rownames(cors)%in%ap1, "purple",
                                      ifelse(rownames(cors)%in%p53, "green",
-                                            ifelse(rownames(cors)%in%nfkb, "violetred", rgb(0,0,0,0.1))))),
+                                            ifelse(rownames(cors)%in%nfkb, "lightskyblue", rgb(0,0,0,0.1))))),
      pch = 16, ylab = "Spearman Correlation Coefficient",
      main = "Correlation between Motif Score and p63 Binding Enrichment after iASPP KO")
 abline(h = 0, lty = 2)
 legend(legend = c("AP-1 Family","E2F Family","NF-kB Family","p53 Family"),
-       pch = 16, col = c("red", "orange", "blue", "green"), "topleft", cex = 1.2)
+       pch = 16, col = c("purple", "orange", "lightskyblue", "green"), "topleft", cex = 1.2)
 ```
 
 #### Investigation of AP-1 correlation with varying p63 motif strength
