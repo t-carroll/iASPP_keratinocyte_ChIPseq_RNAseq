@@ -1,4 +1,4 @@
-﻿# Recreating analyses for JNK-iASPP-AP1 axis paper (Al Moussawi et al. *Cell Reports*, 2022)
+﻿# Recreating analyses for JNK-iASPP-AP1 axis paper (Al Moussawi et al., *Cell Reports*, 2022)
 ## Recreate files needed for downstream analysis
 First, download (untrimmed) RNA-seq and ChIP-seq fastq files from GEO repositories into your analysis directory, BASE_DIR:
 
